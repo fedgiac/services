@@ -376,35 +376,34 @@ where
         &self,
         block_range: &RangeInclusive<u64>,
     ) -> Result<impl Stream<Item = Result<EthcontractEvent<C::Event>>>, ExecutionError> {
-        let should_ignore_decoding_errors =
-            self.on_event_decoding_error != OnEventDecodingError::Ignore;
-        /*let maybe_ignore_decoding_error = |&event| async move {
-            should_ignore_decoding_errors
-                && matches!(
-                    event,
-                    Err(ExecutionError::AbiDecode(abi::Error::InvalidData))
-                )
-        };*/
+        Ok(self
+            .contract
+            .get_events()
+            .from_block((*block_range.start()).into())
+            .to_block((*block_range.end()).into())
+            .block_page_size(500)
+            .query_paginated()
+            .await?
+            .filter(self.discard_decoding_error_filter())
+            .map_err(Error::from))
+    }
 
-        Ok(
-            self.contract
-                .get_events()
-                .from_block((*block_range.start()).into())
-                .to_block((*block_range.end()).into())
-                .block_page_size(500)
-                .query_paginated()
-                .await?
-                .filter_map(move |event|  {
-                    future::ready(match event {
+    fn discard_decoding_error_filter<Event>(
+        &self,
+    ) -> impl for<'a> FnMut(&'a Result<Event, ExecutionError>) -> future::Ready<bool> {
+        let should_preserve_decoding_errors =
+            self.on_event_decoding_error != OnEventDecodingError::Ignore;
+
+        let x = move |event: &Result<Event, ExecutionError>| {
+            future::ready(
+                should_preserve_decoding_errors
+                    || !matches!(
+                        event,
                         Err(ExecutionError::AbiDecode(abi::Error::InvalidData))
-                            if should_ignore_decoding_errors =>
-                        {
-                            None
-                        }
-                        event => Some(event.map_err(Error::from)),
-                    })
-                }), //maybe_ignore_decoding_error
-        )
+                    ),
+            )
+        };
+        x
     }
 
     fn update_last_handled_blocks(&mut self, blocks: &[BlockNumberHash]) {

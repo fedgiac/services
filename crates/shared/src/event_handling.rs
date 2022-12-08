@@ -10,7 +10,7 @@ use ethcontract::{
     errors::ExecutionError,
     Event as EthcontractEvent, EventMetadata,
 };
-use futures::{future, Stream, StreamExt, TryStreamExt};
+use futures::{future, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -350,13 +350,29 @@ where
     ) -> (Vec<BlockNumberHash>, Vec<EthcontractEvent<C::Event>>) {
         let (mut blocks_filtered, mut events) = (vec![], vec![]);
         for chunk in blocks.chunks(MAX_PARALLEL_RPC_CALLS) {
-            for (i, result) in future::join_all(
-                chunk
-                    .iter()
-                    .map(|block| self.contract.get_events().block_hash(block.1).query()),
-            )
+            for (i, result) in future::join_all(chunk.iter().map(|block| {
+                self.contract
+                    .get_events()
+                    .block_hash(block.1)
+                    .query_return_errors()
+                    .map_ok(|events| {
+                        events
+                            .into_iter()
+                            .filter(|event| {
+                                discard_decoding_error_sync_filter(
+                                    event,
+                                    self.on_event_decoding_error,
+                                )
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+            }))
             .await
             .into_iter()
+            .map(|result| match result {
+                Err(err) => Err(err),
+                Ok(ok) => ok,
+            })
             .enumerate()
             {
                 match result {
@@ -394,7 +410,7 @@ where
         let should_preserve_decoding_errors =
             self.on_event_decoding_error != OnEventDecodingError::Ignore;
 
-        let x = move |event: &Result<Event, ExecutionError>| {
+        move |event: &Result<Event, ExecutionError>| {
             future::ready(
                 should_preserve_decoding_errors
                     || !matches!(
@@ -402,8 +418,7 @@ where
                         Err(ExecutionError::AbiDecode(abi::Error::InvalidData))
                     ),
             )
-        };
-        x
+        }
     }
 
     fn update_last_handled_blocks(&mut self, blocks: &[BlockNumberHash]) {
@@ -433,6 +448,18 @@ where
             self.last_handled_blocks.first(),
             self.last_handled_blocks.last(),
         );
+    }
+}
+
+fn discard_decoding_error_sync_filter<E>(
+    event: &Result<E, ExecutionError>,
+    on_event_decoding_error: OnEventDecodingError,
+) -> bool {
+    on_event_decoding_error != OnEventDecodingError::Ignore || {
+        !matches!(
+            event,
+            Err(ExecutionError::AbiDecode(abi::Error::InvalidData))
+        )
     }
 }
 
@@ -746,6 +773,7 @@ mod tests {
             GPv2SettlementContract(contract),
             storage,
             None,
+            OnEventDecodingError::Error,
         );
         let (replacement_blocks, _) = event_handler.past_events_by_block_hashes(&blocks).await;
         assert_eq!(replacement_blocks, blocks[..2]);
@@ -777,6 +805,7 @@ mod tests {
             GPv2SettlementContract(contract),
             storage,
             Some(block),
+            OnEventDecodingError::Error,
         );
         let _result = event_handler.update_events().await;
         // add logs to event handler and observe

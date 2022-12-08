@@ -4,6 +4,7 @@ use crate::{
 };
 use anyhow::{Context, Error, Result};
 use ethcontract::{
+    common::abi,
     contract::{AllEventsBuilder, ParseLog},
     dyns::DynTransport,
     errors::ExecutionError,
@@ -33,7 +34,11 @@ const MAX_PARALLEL_RPC_CALLS: usize = 128;
 /// 3. If this range is too big, split it into two subranges, one to update the deep history blocks, second one
 /// to update the latest blocks (last X canonical blocks)
 /// 4. Do the history update, and if successful, update `last_handled_blocks` to make sure the data is consistent.
-/// 5. If history update is successful, procceed with latest update, and if successful update `last_handled_blocks`.  
+/// 5. If history update is successful, procceed with latest update, and if successful update `last_handled_blocks`.
+///
+/// The parameter `on_event_decoding_error` determines what the event handler does in case it encounters an error when
+/// encoding an event from contract. Ignoring error may be necessary if, for example, the address that we read events
+/// from does not strictly implement the ABI specified by the contract type `C` but may also emit unrelated events.   
 pub struct EventHandler<C, S>
 where
     C: EventRetrieving,
@@ -43,6 +48,13 @@ where
     contract: C,
     store: S,
     last_handled_blocks: Vec<BlockNumberHash>,
+    on_event_decoding_error: OnEventDecodingError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnEventDecodingError {
+    Ignore,
+    Error,
 }
 
 /// `EventStoring` is used by `EventHandler` for the purpose of giving the user freedom
@@ -97,6 +109,7 @@ where
         contract: C,
         store: S,
         start_sync_at_block: Option<BlockNumberHash>,
+        on_event_decoding_error: OnEventDecodingError,
     ) -> Self {
         Self {
             block_retriever,
@@ -108,6 +121,7 @@ where
                     None => vec![],
                 }
             },
+            on_event_decoding_error,
         }
     }
 
@@ -247,6 +261,7 @@ where
             .chunks(INSERT_EVENT_BATCH_SIZE)
             .map(|chunk| chunk.into_iter().collect::<Result<Vec<_>, _>>());
         futures::pin_mut!(events);
+
         // We intentionally do not go with the obvious approach of deleting old events first and
         // then inserting new ones. Instead, we make sure that the deletion and the insertion of the
         // first batch of events happen in one transaction.
@@ -361,6 +376,15 @@ where
         &self,
         block_range: &RangeInclusive<u64>,
     ) -> Result<impl Stream<Item = Result<EthcontractEvent<C::Event>>>, ExecutionError> {
+        let should_ignore_decoding_errors =
+            self.on_event_decoding_error != OnEventDecodingError::Ignore;
+        let maybe_ignore_decoding_error = |event| async move {
+            should_ignore_decoding_errors
+                && matches!(
+                    event,
+                    Err(ExecutionError::AbiDecode(abi::Error::InvalidData))
+                )
+        };
         Ok(self
             .contract
             .get_events()
@@ -369,6 +393,7 @@ where
             .block_page_size(500)
             .query_paginated()
             .await?
+            .filter(maybe_ignore_decoding_error)
             .map_err(Error::from))
     }
 

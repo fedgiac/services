@@ -4,12 +4,13 @@ use crate::{
 };
 use anyhow::{Context, Error, Result};
 use ethcontract::{
+    common::abi,
     contract::{AllEventsBuilder, ParseLog},
     dyns::DynTransport,
     errors::ExecutionError,
     Event as EthcontractEvent, EventMetadata,
 };
-use futures::{future, Stream, StreamExt, TryStreamExt};
+use futures::{future, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -33,7 +34,11 @@ const MAX_PARALLEL_RPC_CALLS: usize = 128;
 /// 3. If this range is too big, split it into two subranges, one to update the deep history blocks, second one
 /// to update the latest blocks (last X canonical blocks)
 /// 4. Do the history update, and if successful, update `last_handled_blocks` to make sure the data is consistent.
-/// 5. If history update is successful, procceed with latest update, and if successful update `last_handled_blocks`.  
+/// 5. If history update is successful, procceed with latest update, and if successful update `last_handled_blocks`.
+///
+/// The parameter `on_event_decoding_error` determines what the event handler does in case it encounters an error when
+/// encoding an event from contract. Ignoring error may be necessary if, for example, the address that we read events
+/// from does not strictly implement the ABI specified by the contract type `C` but may also emit unrelated events.   
 pub struct EventHandler<C, S>
 where
     C: EventRetrieving,
@@ -43,6 +48,13 @@ where
     contract: C,
     store: S,
     last_handled_blocks: Vec<BlockNumberHash>,
+    on_event_decoding_error: OnEventDecodingError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnEventDecodingError {
+    Ignore,
+    Error,
 }
 
 /// `EventStoring` is used by `EventHandler` for the purpose of giving the user freedom
@@ -97,6 +109,7 @@ where
         contract: C,
         store: S,
         start_sync_at_block: Option<BlockNumberHash>,
+        on_event_decoding_error: OnEventDecodingError,
     ) -> Self {
         Self {
             block_retriever,
@@ -108,6 +121,7 @@ where
                     None => vec![],
                 }
             },
+            on_event_decoding_error,
         }
     }
 
@@ -247,6 +261,7 @@ where
             .chunks(INSERT_EVENT_BATCH_SIZE)
             .map(|chunk| chunk.into_iter().collect::<Result<Vec<_>, _>>());
         futures::pin_mut!(events);
+
         // We intentionally do not go with the obvious approach of deleting old events first and
         // then inserting new ones. Instead, we make sure that the deletion and the insertion of the
         // first batch of events happen in one transaction.
@@ -335,13 +350,29 @@ where
     ) -> (Vec<BlockNumberHash>, Vec<EthcontractEvent<C::Event>>) {
         let (mut blocks_filtered, mut events) = (vec![], vec![]);
         for chunk in blocks.chunks(MAX_PARALLEL_RPC_CALLS) {
-            for (i, result) in future::join_all(
-                chunk
-                    .iter()
-                    .map(|block| self.contract.get_events().block_hash(block.1).query()),
-            )
+            for (i, result) in future::join_all(chunk.iter().map(|block| {
+                self.contract
+                    .get_events()
+                    .block_hash(block.1)
+                    .query_return_errors()
+                    .map_ok(|events| {
+                        events
+                            .into_iter()
+                            .filter(|event| {
+                                discard_decoding_error_sync_filter(
+                                    event,
+                                    self.on_event_decoding_error,
+                                )
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+            }))
             .await
             .into_iter()
+            .map(|result| match result {
+                Err(err) => Err(err),
+                Ok(ok) => ok,
+            })
             .enumerate()
             {
                 match result {
@@ -369,7 +400,25 @@ where
             .block_page_size(500)
             .query_paginated()
             .await?
+            .filter(self.discard_decoding_error_filter())
             .map_err(Error::from))
+    }
+
+    fn discard_decoding_error_filter<Event>(
+        &self,
+    ) -> impl for<'a> FnMut(&'a Result<Event, ExecutionError>) -> future::Ready<bool> {
+        let should_preserve_decoding_errors =
+            self.on_event_decoding_error != OnEventDecodingError::Ignore;
+
+        move |event: &Result<Event, ExecutionError>| {
+            future::ready(
+                should_preserve_decoding_errors
+                    || !matches!(
+                        event,
+                        Err(ExecutionError::AbiDecode(abi::Error::InvalidData))
+                    ),
+            )
+        }
     }
 
     fn update_last_handled_blocks(&mut self, blocks: &[BlockNumberHash]) {
@@ -399,6 +448,18 @@ where
             self.last_handled_blocks.first(),
             self.last_handled_blocks.last(),
         );
+    }
+}
+
+fn discard_decoding_error_sync_filter<E>(
+    event: &Result<E, ExecutionError>,
+    on_event_decoding_error: OnEventDecodingError,
+) -> bool {
+    on_event_decoding_error != OnEventDecodingError::Ignore || {
+        !matches!(
+            event,
+            Err(ExecutionError::AbiDecode(abi::Error::InvalidData))
+        )
     }
 }
 
@@ -712,6 +773,7 @@ mod tests {
             GPv2SettlementContract(contract),
             storage,
             None,
+            OnEventDecodingError::Error,
         );
         let (replacement_blocks, _) = event_handler.past_events_by_block_hashes(&blocks).await;
         assert_eq!(replacement_blocks, blocks[..2]);
@@ -743,6 +805,7 @@ mod tests {
             GPv2SettlementContract(contract),
             storage,
             Some(block),
+            OnEventDecodingError::Error,
         );
         let _result = event_handler.update_events().await;
         // add logs to event handler and observe
